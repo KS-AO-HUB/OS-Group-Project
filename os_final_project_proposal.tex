@@ -1,0 +1,92 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{setspace}
+\usepackage{parskip}
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage[table]{xcolor}
+
+\usepackage{algorithm}
+%\usepackage{algorithmic}
+\usepackage{algpseudocode}
+\usepackage[numbers]{natbib}
+\bibliographystyle{abbrvnat}
+
+\lstset{
+  language=C,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  stringstyle=\color{red},
+  numbers=left,
+  numberstyle=\tiny,
+  stepnumber=1,
+  numbersep=8pt,
+  frame=single,
+  breaklines=true,
+  tabsize=2,
+  showstringspaces=false
+}
+
+\usepackage{booktabs}
+\usepackage{array}
+
+\title{Project Proposal: Calculation of Catalan Numbers in a Multithreaded System \\
+\vspace{0.8cm}
+\large COP6611: Operating Systems \\
+Spring 2026}
+\author{Ariel Gomez Garcia\\ ariel22@usf.edu \and
+Yoel Polanco \\yoel@usf.edu }
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+Catalan numbers are a sequence of numbers that appear in many computer science problems, including balanced parentheses, mountain ranges, binary trees, and hands across a table \citep{davis2006catalan}. Although the sequence can be solved recursively, the computation becomes prohibitive as the number of additions and multiplications grows rapidly. For example, the first few numbers of the sequence are $1, 1, 2, 5, 14, 42$, and the formulas used to calculate the values recursively are:
+
+\begin{align}
+C_1 &= C_0 C_0 \\
+C_2 &= C_1 C_0 + C_0 C_1 \\
+C_3 &= C_2 C_0 + C_1 C_1 + C_0 C_2 \\
+C_4 &= C_3 C_0 + C_2 C_1 + C_1 C_2 + C_0 C_3 \\
+C_n &= C_{n-1} C_0 + C_{n-2} C_1 + \dots + C_1 C_{n-2} + C_0 C_{n-1} \\
+C_n &= \sum_{i=0}^{n-1} C_i C_{n-1-i}
+\end{align}
+
+This project proposes solving the Catalan sequence using parallel computation and multithreading in the C programming language.
+
+\section{Problem Statement}
+For large enough sequences, Equation~6 can be decomposed into independent subcomputations. The naïve approach is to calculate each product term sequentially or recursively. However, as shown before, this can become computationally prohibitive for most consumer computers. The goal of this project is to implement a multithreaded solution where separate threads compute different product terms. This will reduce execution time and demonstrate the benefits of parallel programming.
+
+\section{Objectives}
+\begin{itemize}
+\item Implement a baseline single-threaded Catalan sequence solver for comparison.
+\item Use threads to compute each product term in parallel.
+\item Analyze the performance differences between the baseline and the multithreaded implementation.
+\item Identify bottlenecks and scalability limits of the multithreaded approach.
+\end{itemize}
+
+\section{Methodology}
+Following Equation~6, for each Catalan number $C_n$, the program will spawn multiple threads, each computing the product $C_i C_{n-1-i}$. The goal is for each thread to compute its value independently and update a shared variable protected by a mutex. The parent thread will wait for all threads to terminate and then display the final value.
+
+\section{Expected Outcomes}
+The project is expected to show considerably reduced running times in the multithreaded solution. It will also explore potential bottlenecks in both solutions.
+
+\section{Conclusion}
+This project attempts to solve a computationally prohibitive problem, if solved sequentially, using multithreading. By observing runtime differences as the number of Catalan numbers increases, the project demonstrates the effectiveness of multithreading and parallel programming for similar problems.
+
+\bibliography{references}
+
+\end{document}
