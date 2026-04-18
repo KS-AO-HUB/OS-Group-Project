@@ -48,6 +48,11 @@ make run
 make clean
 ```
 
+### Compile wihtout Makefile
+```bash
+gcc -Wall -Wextra -std=c11 -pthread -o catalan catalan.c
+```
+
 ## Input Format
 The input file should contain a single non-negative integer N on the first line.
 The program will compute Catalan numbers C(0) through C(N).
