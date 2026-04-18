@@ -1,32 +1,42 @@
 /*
  * =============================================================================
- *  Project 10: Calculation of Catalan Numbers in a Multithreading System
- *  Course:     COP 6611 — Operating Systems
+ *  Project: Calculation of Catalan Numbers in a Multithreading System
+ *  Course:  COP 6611 — Operating Systems
  *
  *  Description:
  *      Computes Catalan numbers C(0) through C(N) using POSIX threads.
- *      For each C(n), the program spawns n threads — one per product term
- *      C(i) * C(n-1-i) — which run in parallel and accumulate into a
- *      shared sum protected by a mutex lock.
+ *      TWO levels of parallelism:
  *
- *  Approach (matches proposal):
- *      C(n) = sum_{i=0}^{n-1} C(i) * C(n-1-i)
- *      For each n, spawn n threads. Thread i computes C(i)*C(n-1-i)
- *      and adds the result to a shared accumulator under mutex protection.
- *      The parent waits for all threads to finish, then stores C(n).
+ *      Level 1 — One "manager" thread per Catalan number C(1)..C(N).
+ *                Each manager waits (via condition variables) until all
+ *                prerequisite values C(0)..C(n-1) are available.
+ *
+ *      Level 2 — Once dependencies are satisfied, the manager for C(n)
+ *                spawns worker threads that compute disjoint chunks of
+ *                the summation  Σ C(i)*C(n-1-i)  in parallel, then
+ *                combines the partial sums.
+ *
+ *  OS Concepts Demonstrated:
+ *      - Multithreading        (pthread_create / pthread_join)
+ *      - Mutual exclusion      (pthread_mutex_lock / pthread_mutex_unlock)
+ *      - Condition variables   (pthread_cond_wait / pthread_cond_broadcast)
+ *      - Shared memory between threads (global arrays)
+ *      - Dependency management without busy-waiting
+ *      - Parallel reduction    (splitting work among sub-threads)
  *
  *  Compilation:
- *      make          (or)    gcc -Wall -pthread -o catalan catalan.c
+ *      make        (or)  gcc -Wall -Wextra -std=c11 -pthread -o catalan catalan.c
  *
  *  Usage:
  *      ./catalan <input_file>
  *      (input_file contains a single integer N on line 1)
  *
  *  Authors:  Ariel Gomez Garcia, Yoel Polanco
- *  Date:     April 2025
+ *  Date:     April 2026
  * =============================================================================
  */
 
+#define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -34,125 +44,182 @@
 #include <errno.h>
 #include <time.h>
 
+/* Maximum safe index before unsigned long long overflow */
+#define MAX_SAFE_N    33
+
+/* Maximum worker threads used to parallelize the inner summation */
+#define MAX_WORKERS   4
+
+/* Output file name for saving results */
+#define OUTPUT_FILE   "output.txt"
+
 /* ---------------------------------------------------------------------------
- *  Global shared data
+ *  Shared state — all manager threads read/write through these globals.
+ *  catalan[] holds the computed Catalan values and done[] tracks which
+ *  values have been fully computed.  Both arrays are protected by 'lock'.
  * --------------------------------------------------------------------------- */
-
-static unsigned long long *catalan;   /* Results array: catalan[i] = C(i)      */
-static int                 max_n;     /* We compute C(0) .. C(max_n)           */
+static unsigned long long *catalan;   /* catalan[i] = C(i)                   */
+static int                *done;      /* done[i] = 1 once C(i) is computed   */
+static int                 max_n;     /* We compute C(0) .. C(max_n)         */
 
 /* ---------------------------------------------------------------------------
- *  Per-Catalan-number shared accumulator
- *  Each C(n) computation has its own mutex and running sum.
+ *  Synchronization primitives for inter-manager dependency management.
+ *
+ *  A single mutex protects all shared state.  A single condition variable
+ *  is used with broadcast: whenever ANY manager finishes computing its
+ *  value, it broadcasts so that all other waiting managers re-check their
+ *  dependencies.  This avoids the need for per-value condition variables
+ *  while still preventing busy-waiting.
  * --------------------------------------------------------------------------- */
-static unsigned long long  shared_sum;        /* Accumulator for current C(n)  */
-static pthread_mutex_t     sum_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t lock       = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  deps_ready = PTHREAD_COND_INITIALIZER;
 
 /* ---------------------------------------------------------------------------
- *  Thread argument: which product term to compute
+ *  Argument passed to each manager thread
  * --------------------------------------------------------------------------- */
 typedef struct {
-    int n;           /* We are computing C(n)                                  */
-    int i;           /* This thread computes C(i) * C(n-1-i)                   */
-    int thread_id;   /* Logical thread ID (for printing)                       */
-} term_arg_t;
+    int n;                            /* This manager computes C(n) */
+} manager_arg_t;
 
 /* ---------------------------------------------------------------------------
- *  Thread function: compute one product term C(i) * C(n-1-i)
- *  and add it to the shared accumulator under mutex protection.
+ *  Argument passed to each worker thread (inner-summation parallelism)
  * --------------------------------------------------------------------------- */
-static void *compute_term(void *arg)
+typedef struct {
+    int                n;             /* Computing C(n)             */
+    int                lo;            /* Start index (inclusive)    */
+    int                hi;            /* End index (exclusive)      */
+    unsigned long long partial_sum;   /* Result written by worker   */
+} worker_arg_t;
+
+/* ---------------------------------------------------------------------------
+ *  check_deps_ready:  returns 1 iff all C(0)..C(n-1) are computed.
+ *  MUST be called with 'lock' held.
+ * --------------------------------------------------------------------------- */
+static int check_deps_ready(int n)
 {
-    term_arg_t *ta = (term_arg_t *)arg;
-    int n = ta->n;
-    int i = ta->i;
+    for (int i = 0; i < n; i++) {
+        if (!done[i]) return 0;
+    }
+    return 1;
+}
 
-    /* Compute the product (read-only access to previously computed values) */
-    unsigned long long product = catalan[i] * catalan[n - 1 - i];
+/* ---------------------------------------------------------------------------
+ *  Worker thread: computes a partial sum of the Catalan recurrence.
+ *
+ *  partial_sum = Σ  C(i) * C(n-1-i)   for i in [lo, hi)
+ *
+ *  By the time workers are spawned, all C(0)..C(n-1) are guaranteed to
+ *  be available (the manager already waited for them), and the manager
+ *  has released the global mutex.  Workers only READ from catalan[],
+ *  so no additional locking is needed — multiple workers can safely
+ *  read the same published values concurrently.
+ * --------------------------------------------------------------------------- */
+static void *worker_func(void *arg)
+{
+    worker_arg_t *wa = (worker_arg_t *)arg;
+    unsigned long long sum = 0;
 
-    /* Lock mutex, update shared sum, unlock */
-    pthread_mutex_lock(&sum_mutex);
-    shared_sum += product;
-    printf("    [Thread %2d]  C(%d)*C(%d) = %llu * %llu = %llu  |  running sum = %llu\n",
-           ta->thread_id, i, n - 1 - i, catalan[i], catalan[n - 1 - i],
-           product, shared_sum);
-    pthread_mutex_unlock(&sum_mutex);
+    for (int i = wa->lo; i < wa->hi; i++) {
+        sum += catalan[i] * catalan[wa->n - 1 - i];
+    }
 
-    free(ta);
+    wa->partial_sum = sum;
     return NULL;
 }
 
 /* ---------------------------------------------------------------------------
- *  Compute C(n) by spawning n threads (one per product term)
+ *  Manager thread: compute C(n)
+ *
+ *  1.  Lock the global mutex.
+ *  2.  Wait (cond_wait) until all C(0)..C(n-1) are marked done.
+ *  3.  UNLOCK the mutex — so that other managers whose dependencies are
+ *      now satisfied can proceed concurrently while we compute.  This is
+ *      critical: if we held the lock during computation, all managers
+ *      would serialize and we'd lose all parallelism.
+ *  4.  Spawn worker threads to compute disjoint chunks of the summation.
+ *  5.  Join all workers, combine partial sums (parallel reduction).
+ *  6.  Re-lock the mutex, store the result, mark done[n] = 1, broadcast
+ *      to wake all managers that might depend on C(n).
+ *  7.  Unlock the mutex.
  * --------------------------------------------------------------------------- */
-static void compute_catalan_parallel(int n)
+static void *manager_func(void *arg)
 {
-    if (n == 0) {
-        catalan[0] = 1;
-        printf("  C(0) = 1  (base case)\n");
-        return;
+    manager_arg_t *ma = (manager_arg_t *)arg;
+    int n = ma->n;
+
+    /* ---- Step 1-2: Wait for dependencies ---- */
+    pthread_mutex_lock(&lock);
+    while (!check_deps_ready(n)) {
+        printf("  [Manager C(%2d)]  Waiting for dependencies...\n", n);
+        pthread_cond_wait(&deps_ready, &lock);
     }
+    printf("  [Manager C(%2d)]  Dependencies satisfied — spawning workers.\n", n);
 
-    /* Reset shared accumulator */
-    shared_sum = 0;
+    /* Step 3: Release lock so other managers can proceed concurrently
+     * while we compute.  This avoids serializing all work through one
+     * mutex — the whole point of the two-level parallel design. */
+    pthread_mutex_unlock(&lock);
 
-    printf("  Computing C(%d) — spawning %d thread(s):\n", n, n);
+    /* ---- Step 4: Determine number of workers and partition work ---- */
+    int num_terms = n;                  /* number of terms in the sum */
+    int num_workers = num_terms < MAX_WORKERS ? num_terms : MAX_WORKERS;
 
-    /* Allocate thread handles */
-    pthread_t *threads = malloc((size_t)n * sizeof(pthread_t));
-    if (!threads) { perror("malloc"); exit(EXIT_FAILURE); }
+    pthread_t     wt[MAX_WORKERS];
+    worker_arg_t  wa[MAX_WORKERS];
+    int chunk     = num_terms / num_workers;
+    int remainder = num_terms % num_workers;
 
-    /* Spawn one thread per product term */
-    for (int i = 0; i < n; i++) {
-        term_arg_t *ta = malloc(sizeof(term_arg_t));
-        if (!ta) { perror("malloc"); exit(EXIT_FAILURE); }
+    int start = 0;
+    for (int w = 0; w < num_workers; w++) {
+        wa[w].n  = n;
+        wa[w].lo = start;
+        wa[w].hi = start + chunk + (w < remainder ? 1 : 0);
+        wa[w].partial_sum = 0;
+        start = wa[w].hi;
 
-        ta->n         = n;
-        ta->i         = i;
-        ta->thread_id = i;
-
-        int rc = pthread_create(&threads[i], NULL, compute_term, (void *)ta);
+        int rc = pthread_create(&wt[w], NULL, worker_func, &wa[w]);
         if (rc != 0) {
-            fprintf(stderr, "Error: pthread_create failed: %s\n", strerror(rc));
+            fprintf(stderr, "Error: pthread_create worker: %s\n", strerror(rc));
             exit(EXIT_FAILURE);
         }
     }
 
-    /* Wait for all threads to finish */
-    for (int i = 0; i < n; i++) {
-        pthread_join(threads[i], NULL);
+    /* ---- Step 5: Join workers and combine partial sums ---- */
+    unsigned long long total = 0;
+    for (int w = 0; w < num_workers; w++) {
+        pthread_join(wt[w], NULL);
+        total += wa[w].partial_sum;
     }
 
-    /* Store the result */
-    catalan[n] = shared_sum;
-    printf("  C(%d) = %llu\n\n", n, catalan[n]);
+    /* ---- Step 6: Store result under lock, broadcast ---- */
+    pthread_mutex_lock(&lock);
+    catalan[n] = total;
+    done[n]    = 1;
+    printf("  [Manager C(%2d)]  C(%d) = %llu  ✓  (workers: %d)\n\n",
+           n, n, total, num_workers);
+    pthread_cond_broadcast(&deps_ready);
+    pthread_mutex_unlock(&lock);
 
-    free(threads);
+    free(ma);
+    return NULL;
 }
 
 /* ---------------------------------------------------------------------------
- *  Baseline: single-threaded iterative computation (for comparison)
+ *  Baseline: single-threaded iterative computation (for verification)
  * --------------------------------------------------------------------------- */
-static unsigned long long catalan_iterative(int n)
+static void catalan_iterative(unsigned long long *result, int n)
 {
-    if (n <= 1) return 1;
-    unsigned long long *c = calloc((size_t)(n + 1), sizeof(unsigned long long));
-    if (!c) { perror("calloc"); exit(EXIT_FAILURE); }
-
-    c[0] = c[1] = 1;
-    for (int i = 2; i <= n; i++) {
-        c[i] = 0;
+    result[0] = 1;
+    for (int i = 1; i <= n; i++) {
+        result[i] = 0;
         for (int j = 0; j < i; j++) {
-            c[i] += c[j] * c[i - 1 - j];
+            result[i] += result[j] * result[i - 1 - j];
         }
     }
-    unsigned long long result = c[n];
-    free(c);
-    return result;
 }
 
 /* ---------------------------------------------------------------------------
- *  Timing helper: returns current time in seconds (high resolution)
+ *  Timing helper — returns wall-clock time in seconds using CLOCK_MONOTONIC
  * --------------------------------------------------------------------------- */
 static double get_time(void)
 {
@@ -162,11 +229,63 @@ static double get_time(void)
 }
 
 /* ---------------------------------------------------------------------------
+ *  write_results_to_file:  Writes the results summary to OUTPUT_FILE so
+ *  that a persistent copy of the output is available for the submission.
+ * --------------------------------------------------------------------------- */
+static void write_results_to_file(unsigned long long *cat,
+                                  unsigned long long *base,
+                                  int n, int all_match,
+                                  double mt_time, double st_time)
+{
+    FILE *out = fopen(OUTPUT_FILE, "w");
+    if (!out) {
+        fprintf(stderr, "Warning: could not open '%s' for writing: %s\n",
+                OUTPUT_FILE, strerror(errno));
+        return;
+    }
+
+    fprintf(out, "============================================================\n");
+    fprintf(out, "  Catalan Numbers — Results Summary\n");
+    fprintf(out, "  C(0) through C(%d)\n", n);
+    fprintf(out, "============================================================\n\n");
+
+    fprintf(out, "  %5s  %22s  %22s  %s\n",
+            "n", "C(n) [threaded]", "C(n) [baseline]", "Match?");
+    fprintf(out, "  %5s  %22s  %22s  %s\n",
+            "-----", "----------------------",
+            "----------------------", "------");
+
+    for (int i = 0; i <= n; i++) {
+        const char *status = (cat[i] == base[i]) ? "  OK" : "  FAIL";
+        fprintf(out, "  %5d  %22llu  %22llu  %s\n",
+                i, cat[i], base[i], status);
+    }
+
+    fprintf(out, "\n  Verification: %s\n",
+            all_match ? "ALL RESULTS MATCH" : "MISMATCH DETECTED");
+
+    fprintf(out, "\n============================================================\n");
+    fprintf(out, "  PERFORMANCE COMPARISON\n");
+    fprintf(out, "============================================================\n");
+    fprintf(out, "  Multithreaded time : %.6f seconds\n", mt_time);
+    fprintf(out, "  Single-threaded    : %.6f seconds\n", st_time);
+    if (mt_time > 0) {
+        fprintf(out, "  Ratio (ST / MT)    : %.4fx\n", st_time / mt_time);
+    }
+    fprintf(out, "  Manager threads    : %d\n", n);
+    fprintf(out, "  Max workers/manager: %d\n", MAX_WORKERS);
+    fprintf(out, "============================================================\n");
+
+    fclose(out);
+    printf("  Results written to '%s'\n", OUTPUT_FILE);
+}
+
+/* ---------------------------------------------------------------------------
  *  Main
  * --------------------------------------------------------------------------- */
 int main(int argc, char *argv[])
 {
-    /* ---- Parse command-line arguments ---- */
+    /* ---- Validate command-line arguments ---- */
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <input_file>\n", argv[0]);
         fprintf(stderr, "  input_file: text file with a single integer N\n");
@@ -187,42 +306,93 @@ int main(int argc, char *argv[])
     }
     fclose(fp);
 
+    /* ---- Overflow warning ---- */
+    if (max_n > MAX_SAFE_N) {
+        fprintf(stderr, "Warning: C(n) for n > %d overflows unsigned long long.\n",
+                MAX_SAFE_N);
+        fprintf(stderr, "Results beyond C(%d) may be incorrect.\n\n", MAX_SAFE_N);
+    }
+
+    /* ---- Thread-count feasibility note ---- */
+    /*
+     * Each manager thread consumes stack space (typically 2-8 MB default).
+     * For very large N (thousands), the OS may refuse to create that many
+     * threads.  The program handles this gracefully — pthread_create errors
+     * are caught and reported.  For this project N <= 33 is the practical
+     * limit due to unsigned long long overflow anyway.
+     */
+
     printf("============================================================\n");
     printf("  Catalan Numbers — Multithreaded Computation (Pthreads)\n");
     printf("  Computing C(0) through C(%d)\n", max_n);
     printf("============================================================\n\n");
+    printf("  Two levels of parallelism:\n");
+    printf("    Level 1: %d manager threads (one per Catalan number)\n", max_n);
+    printf("    Level 2: up to %d worker threads per manager\n\n", MAX_WORKERS);
 
-    /* ---- Allocate results array ---- */
-    catalan = calloc((size_t)(max_n + 1), sizeof(unsigned long long));
-    if (!catalan) { perror("calloc"); return EXIT_FAILURE; }
+    /* ---- Allocate shared arrays ---- */
+    catalan = calloc((size_t)(max_n + 1), sizeof *catalan);
+    done    = calloc((size_t)(max_n + 1), sizeof *done);
+    if (!catalan || !done) { perror("calloc"); return EXIT_FAILURE; }
 
     /* ================================================================
      *  MULTITHREADED COMPUTATION
      * ================================================================ */
     printf("--- Multithreaded Computation ---\n\n");
+
+    /* Base case: C(0) = 1 */
+    pthread_mutex_lock(&lock);
+    catalan[0] = 1;
+    done[0]    = 1;
+    printf("  [Main thread]  C(0) = 1  (base case)\n\n");
+    pthread_cond_broadcast(&deps_ready);
+    pthread_mutex_unlock(&lock);
+
     double mt_start = get_time();
 
-    for (int n = 0; n <= max_n; n++) {
-        compute_catalan_parallel(n);
+    /* Spawn all N manager threads simultaneously */
+    pthread_t *managers = NULL;
+    if (max_n > 0) {
+        managers = malloc((size_t)max_n * sizeof(pthread_t));
+        if (!managers) { perror("malloc"); return EXIT_FAILURE; }
+
+        for (int n = 1; n <= max_n; n++) {
+            manager_arg_t *ma = malloc(sizeof *ma);
+            if (!ma) { perror("malloc"); return EXIT_FAILURE; }
+            ma->n = n;
+
+            int rc = pthread_create(&managers[n - 1], NULL, manager_func, ma);
+            if (rc != 0) {
+                fprintf(stderr, "Error: pthread_create for C(%d): %s\n",
+                        n, strerror(rc));
+                return EXIT_FAILURE;
+            }
+        }
+
+        for (int n = 1; n <= max_n; n++) {
+            pthread_join(managers[n - 1], NULL);
+        }
+        free(managers);
     }
 
     double mt_end = get_time();
     double mt_time = mt_end - mt_start;
 
     /* ================================================================
-     *  SINGLE-THREADED BASELINE (for comparison)
+     *  SINGLE-THREADED BASELINE (for verification)
+     *
+     *  Note: the multithreaded timer includes thread creation and
+     *  synchronization overhead, while the single-threaded timer only
+     *  measures raw computation.  This is intentional — the comparison
+     *  shows the real-world cost of the threaded approach.
      * ================================================================ */
     printf("--- Single-Threaded Baseline ---\n\n");
-    double st_start = get_time();
 
-    unsigned long long *baseline = calloc((size_t)(max_n + 1),
-                                          sizeof(unsigned long long));
+    unsigned long long *baseline = calloc((size_t)(max_n + 1), sizeof *baseline);
     if (!baseline) { perror("calloc"); return EXIT_FAILURE; }
 
-    for (int n = 0; n <= max_n; n++) {
-        baseline[n] = catalan_iterative(n);
-    }
-
+    double st_start = get_time();
+    catalan_iterative(baseline, max_n);
     double st_end = get_time();
     double st_time = st_end - st_start;
 
@@ -258,20 +428,23 @@ int main(int argc, char *argv[])
     printf("  Multithreaded time : %.6f seconds\n", mt_time);
     printf("  Single-threaded    : %.6f seconds\n", st_time);
 
-    if (st_time > 0) {
-        double speedup = st_time / mt_time;
-        printf("  Speedup            : %.2fx\n", speedup);
+    if (mt_time > 0) {
+        printf("  Ratio (ST / MT)    : %.4fx\n", st_time / mt_time);
     }
 
-    /* Total threads spawned: 0 + 1 + 2 + ... + max_n = max_n*(max_n+1)/2 */
-    long long total_threads = (long long)max_n * (max_n + 1) / 2;
-    printf("  Total threads used : %lld\n", total_threads);
-    printf("============================================================\n");
+    printf("  Manager threads    : %d\n", max_n);
+    printf("  Max workers/manager: %d\n", MAX_WORKERS);
+    printf("============================================================\n\n");
+
+    /* ---- Write results to output file ---- */
+    write_results_to_file(catalan, baseline, max_n, all_match, mt_time, st_time);
 
     /* ---- Cleanup ---- */
     free(catalan);
+    free(done);
     free(baseline);
-    pthread_mutex_destroy(&sum_mutex);
+    pthread_mutex_destroy(&lock);
+    pthread_cond_destroy(&deps_ready);
 
     return EXIT_SUCCESS;
 }
